@@ -680,6 +680,10 @@ void MleRouter::HandleLinkRequest(RxInfo &aRxInfo)
 
     Log(kMessageReceive, kTypeLinkRequest, aRxInfo.mMessageInfo.GetPeerAddr());
 
+    // Ensure the device is not disabled before counting the formation message
+    VerifyOrExit(mRole != kRoleDisabled, error = kErrorInvalidState);
+    FormationMessageHeard(kFormationLinkRequest);
+
     VerifyOrExit(IsRouterOrLeader(), error = kErrorInvalidState);
 
     VerifyOrExit(!IsAttaching(), error = kErrorInvalidState);
@@ -1223,7 +1227,27 @@ Error MleRouter::HandleAdvertisement(RxInfo &aRxInfo, uint16_t aSourceAddress, c
 #endif
         )
         {
-            Attach(kBetterPartition);
+            // If we are a Router or Leader and there is RouteTLV Data...
+            if ( ((GetRole() == kRoleRouter) ||
+                   ((GetRole() == kRoleLeader) && !IsSingleton()))
+                 && routeTlv.IsValid() )
+            {
+                // We heard an advertisement from a higher priority network with the same Router ID
+                // present as our current Router ID.  
+                // There is no point attempting to attach and keep our ID, since we are going to fail.  
+                if (routeTlv.IsRouterIdSet(RouterIdFromRloc16(GetRloc16())))
+                {
+                    IgnoreError(BecomeDetached());
+                }
+                else
+                {
+                    Attach(kBetterPartition);
+                }
+            }
+            else
+            {
+                Attach(kBetterPartition);
+            }
         }
 
         ExitNow(error = kErrorDrop);
@@ -1456,6 +1480,19 @@ void MleRouter::HandleParentRequest(RxInfo &aRxInfo)
 
 exit:
     LogProcessError(kTypeParentRequest, error);
+    
+    // Ensure the device is not disabled, and aquire the scan mask in case we exited early
+    if (mRole != kRoleDisabled && kErrorNone == Tlv::Find<ScanMaskTlv>(aRxInfo.mMessage, scanMask))
+    {
+        if (ScanMaskTlv::IsEndDeviceFlagSet(scanMask))
+        {
+            FormationMessageHeard(kFormationParentRequestREEDs);
+        }
+        else if (ScanMaskTlv::IsRouterFlagSet(scanMask))
+        {
+            FormationMessageHeard(kFormationParentRequestRouters);
+        }
+    }
 }
 
 bool MleRouter::HasNeighborWithGoodLinkQuality(void) const
@@ -1550,7 +1587,8 @@ void MleRouter::HandleTimeTick(void)
     case kRoleRouter:
         LogDebg("Leader age %lu", ToUlong(mRouterTable.GetLeaderAge()));
 
-        if ((mRouterTable.GetActiveRouterCount() > 0) && (mRouterTable.GetLeaderAge() >= mNetworkIdTimeout))
+        if ((mRouterTable.GetActiveRouterCount() > 0) && (mRouterTable.GetLeaderAge() >= mNetworkIdTimeout)
+            && (mAttachState == kAttachStateIdle))
         {
             LogInfo("Leader age timeout");
             Attach(kSamePartition);
@@ -3549,6 +3587,10 @@ template <> void MleRouter::HandleTmf<kUriAddressSolicit>(Coap::Message &aMessag
         responseStatus = ThreadStatusTlv::kUnrecognizedStatus;
         ExitNow();
     }
+
+    // If we are about to leave the network as the Leader, then there is no reason
+    // we should upgrade more routers to then have to transition as well.
+    VerifyOrExit(mAttachState == kAttachStateIdle);
 
     if (rloc16 != Mac::kShortAddrInvalid)
     {

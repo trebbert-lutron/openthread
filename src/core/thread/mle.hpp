@@ -117,6 +117,7 @@ class Mle : public InstanceLocator, private NonCopyable
     friend class ot::LinkMetrics::Initiator;
 #endif
     friend class ot::UnitTester;
+    enum NetworkFormationMessages : uint8_t;
 
 public:
     /**
@@ -190,6 +191,16 @@ public:
      *
      */
     Error BecomeDetached(void);
+
+    /**
+     * This method causes the Thread interface to detach from the Thread network.
+     * And then use additional jitter when reconnecting
+     *
+     * @retval OT_ERROR_NONE           Successfully detached from the Thread network.
+     * @retval OT_ERROR_INVALID_STATE  MLE is Disabled.
+     *
+     */
+    Error BecomeDetachedFromParent(void);
 
     /**
      * Causes the Thread interface to attempt an MLE attach.
@@ -506,6 +517,20 @@ public:
      */
     void SetTimeout(uint32_t aTimeout);
 
+        /**
+     * This method returns the amount of time left before the attach timer fires (or 0)
+     * 
+     * @returns The time left before the attach timer fires, or 0, in milliseconds.
+     */
+    uint32_t GetAttachTimerTimeLeft(void) const;
+
+    /**
+     * This method returns the number of messages heard of a specific type since it was last called.
+     * 
+     * @returns The number of packets heard, or a maximum of 255.
+     */
+    uint8_t GetFormationMessagesHeardSinceLastQuery(NetworkFormationMessages aMessageType);
+
     /**
      * Returns the RLOC16 assigned to the Thread interface.
      *
@@ -779,6 +804,13 @@ private:
     static constexpr uint8_t kMaxCriticalTxCount        = 6; // Max tx count for critical MLE message
     static constexpr uint8_t kMaxChildKeepAliveAttempts = 4; // Max keep alive attempts before reattach
 
+    static constexpr uint16_t kAttachParentRequestRouterBackoff = 500;   ///< Time added (ms) to the attach timer when another device sends a parent request for Routers while this node is detached
+    static constexpr uint16_t kAttachParentRequestREEDBackoff   = 2000;  ///< Time added (ms) to the attach timer when another device sends a parent request for REEDs while this node is detached
+    static constexpr uint16_t kAttachLinkRequestBackoff         = 1000;  ///< Time added (ms) to the attach timer when a Router sends a broadcast link request while this node is detached
+    static constexpr uint16_t kAttachRequestBackoffJitter       = 1000;  ///< Maximum additional jitter time added (ms) to the attach timer when backing off.
+    static constexpr uint16_t kAttachRequestBackoffJitterREEDs  = 10000; ///< Maximum additional jitter time added (ms) to the attach timer when backing off and heard a REED parent request.
+    static constexpr uint16_t kAttachBackoffMinimum             = 500;   ///< Smallest amount of time (ms) for the attach timer when backing off due to other node(s) attaching.
+
     //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     // Attach backoff feature (CONFIG_ENABLE_ATTACH_BACKOFF) - Intervals are in milliseconds.
 
@@ -982,6 +1014,16 @@ private:
 #if OPENTHREAD_CONFIG_TIME_SYNC_ENABLE
         kTypeTimeSync,
 #endif
+    };
+
+    /**
+     * This enumeration represents types of messages that are tracked during attachment.
+     */
+    enum NetworkFormationMessages : uint8_t
+    {
+        kFormationLinkRequest = 0,
+        kFormationParentRequestRouters = 1,
+        kFormationParentRequestREEDs = 2,
     };
 
     //------------------------------------------------------------------------------------------------------------------
@@ -1274,7 +1316,7 @@ private:
     Error      HandleLeaderData(RxInfo &aRxInfo);
     void       ProcessAnnounce(void);
     bool       HasUnregisteredAddress(void);
-    uint32_t   GetAttachStartDelay(void) const;
+    uint32_t   GetAttachStartDelay(uint8_t jitterScale) const;
     void       SendParentRequest(ParentRequestType aType);
     Error      SendChildIdRequest(void);
     Error      GetNextAnnounceChannel(uint8_t &aChannel) const;
@@ -1299,6 +1341,11 @@ private:
                                       const SecurityHeader   &aHeader);
     void RemoveDelayedMessage(Message::SubType aSubType, MessageType aMessageType, const Ip6::Address *aDestination);
     void RemoveDelayedDataRequestMessage(const Ip6::Address &aDestination);
+
+    void ClearFormationMessagesHeard(void);
+    void FormationMessageHeard(NetworkFormationMessages aMessageType);
+    void HandleLinkRequest(const Message &aMessage, const Ip6::MessageInfo &aMessageInfo, Neighbor *aNeighbor);
+    void HandleParentRequest(const Message &aMessage, const Ip6::MessageInfo &aMessageInfo);
 
 #if OPENTHREAD_CONFIG_MLE_INFORM_PREVIOUS_PARENT_ON_REATTACH
     void InformPreviousParent(void);
@@ -1442,6 +1489,15 @@ private:
     Ip6::Netif::UnicastAddress   mMeshLocal16;
     Ip6::Netif::MulticastAddress mLinkLocalAllThreadNodes;
     Ip6::Netif::MulticastAddress mRealmLocalAllThreadNodes;
+    bool                         mParentRecentlyAbandonedNode;
+    
+    uint8_t    mFormationLinkRequestsHeard;
+    uint8_t    mFormationParentRequestsRoutersHeard;
+    uint8_t    mFormationParentRequestsREEDsHeard;
+    
+    uint8_t    mFormationLinkRequestsHeardSinceLastQuery;
+    uint8_t    mFormationParentRequestsRoutersHeardSinceLastQuery;
+    uint8_t    mFormationParentRequestsREEDsHeardSinceLastQuery;
 };
 
 } // namespace Mle
