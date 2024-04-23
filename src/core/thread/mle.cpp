@@ -114,6 +114,13 @@ Mle::Mle(Instance &aInstance)
     , mDelayedResponseTimer(aInstance)
     , mMessageTransmissionTimer(aInstance)
     , mDetachGracefullyTimer(aInstance)
+    , mParentRecentlyAbandonedNode(false)
+    , mFormationLinkRequestsHeard(0)
+    , mFormationParentRequestsRoutersHeard(0)
+    , mFormationParentRequestsREEDsHeard(0)
+    , mFormationLinkRequestsHeardSinceLastQuery(0)
+    , mFormationParentRequestsRoutersHeardSinceLastQuery(0)
+    , mFormationParentRequestsREEDsHeardSinceLastQuery(0)
 {
     mParent.Init(aInstance);
     mParentCandidate.Init(aInstance);
@@ -358,6 +365,7 @@ void Mle::SetAttachState(AttachState aState)
 {
     VerifyOrExit(aState != mAttachState);
     LogInfo("AttachState %s -> %s", AttachStateToString(mAttachState), AttachStateToString(aState));
+    ClearFormationMessagesHeard();
     mAttachState = aState;
 
 exit:
@@ -616,7 +624,18 @@ void Mle::Attach(AttachMode aMode)
         mCounters.mBetterPartitionAttachAttempts++;
     }
 
-    mAttachTimer.Start(GetAttachStartDelay());
+    if ( (aMode == kAnyPartition) && (mParentRecentlyAbandonedNode != true) )
+    {
+        mAttachTimer.Start(GetAttachStartDelay(1));
+    }
+    else
+    {
+        // if the parent abandoned this node then scale the delay so that 
+        // we are not competing with other children
+        mAttachTimer.Start(GetAttachStartDelay(20));
+    }
+
+    mParentRecentlyAbandonedNode = false;
 
     if (IsDetached())
     {
@@ -639,12 +658,10 @@ exit:
     return;
 }
 
-uint32_t Mle::GetAttachStartDelay(void) const
+uint32_t Mle::GetAttachStartDelay(uint8_t jitterScale) const
 {
     uint32_t delay = 1;
     uint32_t jitter;
-
-    VerifyOrExit(IsDetached());
 
     if (mAttachCounter == 0)
     {
@@ -669,7 +686,7 @@ uint32_t Mle::GetAttachStartDelay(void) const
     }
 #endif // OPENTHREAD_CONFIG_MLE_ATTACH_BACKOFF_ENABLE
 
-    jitter = Random::NonCrypto::GetUint32InRange(0, kAttachStartJitter);
+    jitter = Random::NonCrypto::GetUint32InRange(0, kAttachStartJitter * jitterScale);
 
     if (jitter + delay > delay) // check for overflow
     {
@@ -1430,6 +1447,35 @@ void Mle::HandleAttachTimer(void)
         ExitNow();
     }
 
+    // These states are the ones that will attempt to send a parent request.
+    // Check to see if this device has heard any of the attachment messages.
+    // If so, pick a random time to come back and check again, based on 
+    // how many messages received.
+    if (mAttachState == kAttachStateParentRequest || mAttachState == kAttachStateStart)
+    {
+        // Start by picking the maximum time
+        delay = (mFormationLinkRequestsHeard * kAttachLinkRequestBackoff) +
+                (mFormationParentRequestsRoutersHeard * kAttachParentRequestRouterBackoff) +
+                (mFormationParentRequestsREEDsHeard * kAttachParentRequestREEDBackoff);
+
+        // If no messages were heard, this will be 0, and this block falls through.
+        if (delay != 0)
+        {
+            // There is a different jitter figure added if there was a REED parent request
+            // As these messages trigger a large amount of devices to respond
+            if (mFormationParentRequestsREEDsHeard != 0)
+            {
+                delay = Random::NonCrypto::GetUint32InRange(kAttachBackoffMinimum, delay + kAttachRequestBackoffJitterREEDs);
+            }
+            else
+            {
+                delay = Random::NonCrypto::GetUint32InRange(kAttachBackoffMinimum, delay + kAttachRequestBackoffJitter);
+            }
+
+            ExitNow();
+        }
+    }
+
     switch (mAttachState)
     {
     case kAttachStateIdle:
@@ -1500,6 +1546,8 @@ void Mle::HandleAttachTimer(void)
     }
 
 exit:
+    // After each iteration of the attachment timer, reset the number of messages heard.
+    ClearFormationMessagesHeard();
 
     if (delay != 0)
     {
@@ -1998,7 +2046,9 @@ void Mle::HandleMessageTransmissionTimer(void)
         {
             Ip6::Address destination;
 
-            VerifyOrExit(mDataRequestAttempts < kMaxChildKeepAliveAttempts, IgnoreError(BecomeDetached()));
+            // This case of becoming detached from a parent is due to the data request attempts
+            // exceeding the maximum
+            VerifyOrExit(mDataRequestAttempts < kMaxChildKeepAliveAttempts, IgnoreError(BecomeDetachedFromParent()));
 
             destination.SetToLinkLocalAddress(mParent.GetExtAddress());
 
@@ -2030,7 +2080,9 @@ void Mle::HandleMessageTransmissionTimer(void)
         break;
     }
 
-    VerifyOrExit(mChildUpdateAttempts < kMaxChildKeepAliveAttempts, IgnoreError(BecomeDetached()));
+    // This case of becoming detached from a parent is due to the child update attempts
+    // exceeding the maximum
+    VerifyOrExit(mChildUpdateAttempts < kMaxChildKeepAliveAttempts, IgnoreError(BecomeDetachedFromParent()));
 
     if (SendChildUpdateRequest() == kErrorNone)
     {
@@ -2053,7 +2105,8 @@ Error Mle::SendChildUpdateRequest(ChildUpdateRequestMode aMode)
     if (!mParent.IsStateValidOrRestoring())
     {
         LogWarn("No valid parent when sending Child Update Request");
-        IgnoreError(BecomeDetached());
+        // Was unable to send a child update request because the parent state is invalid.
+        IgnoreError(BecomeDetachedFromParent());
         ExitNow();
     }
 
@@ -2821,7 +2874,10 @@ void Mle::HandleAdvertisement(RxInfo &aRxInfo)
         if (mParent.GetRloc16() != sourceAddress)
         {
             // Remove stale parent.
-            IgnoreError(BecomeDetached());
+            // Heard an advertisement from our parent's MAC address but the RLOC reported
+            // doesn't match our parent's RLOC.  Must have moved partitions, and didn't get
+            // to keep the RLOC, so we should detach.
+            IgnoreError(BecomeDetachedFromParent());
             ExitNow();
         }
 
@@ -3613,7 +3669,9 @@ void Mle::HandleChildUpdateResponse(RxInfo &aRxInfo)
 
         if (RouterIdFromRloc16(sourceAddress) != RouterIdFromRloc16(GetRloc16()))
         {
-            IgnoreError(BecomeDetached());
+            // Heard a child update response, but it's from another Router RLOC than
+            // our current RLOC's Router address.  Parent changed RLOC, so we should detach.
+            IgnoreError(BecomeDetachedFromParent());
             ExitNow();
         }
 
@@ -3904,6 +3962,103 @@ bool Mle::IsAnycastLocator(const Ip6::Address &aAddress) const
 }
 
 bool Mle::IsMeshLocalAddress(const Ip6::Address &aAddress) const { return (aAddress.GetPrefix() == mMeshLocalPrefix); }
+
+void Mle::FormationMessageHeard(NetworkFormationMessages aMessageType)
+{
+    switch(aMessageType)
+    {
+        case kFormationLinkRequest:
+            if (mFormationLinkRequestsHeard < UINT8_MAX)
+            {
+                mFormationLinkRequestsHeard++;
+            }
+
+            if (mFormationLinkRequestsHeardSinceLastQuery < UINT8_MAX)
+            {
+                mFormationLinkRequestsHeardSinceLastQuery++;
+            }
+            
+        break;
+
+        case kFormationParentRequestRouters:
+            if (mFormationParentRequestsRoutersHeard < UINT8_MAX)
+            {
+                mFormationParentRequestsRoutersHeard++;
+            }
+
+            if (mFormationParentRequestsRoutersHeardSinceLastQuery < UINT8_MAX)
+            {
+                mFormationParentRequestsRoutersHeardSinceLastQuery++;
+            }
+            
+        break;
+
+        case kFormationParentRequestREEDs:
+            if (mFormationParentRequestsREEDsHeard < UINT8_MAX)
+            {
+                mFormationParentRequestsREEDsHeard++;
+            }
+
+            if (mFormationParentRequestsREEDsHeardSinceLastQuery < UINT8_MAX)
+            {
+                mFormationParentRequestsREEDsHeardSinceLastQuery++;
+            }
+        break;
+
+        default:
+        break;
+    }
+}
+
+void Mle::ClearFormationMessagesHeard(void)
+{
+    mFormationLinkRequestsHeard = 0;
+    mFormationParentRequestsRoutersHeard = 0;
+    mFormationParentRequestsREEDsHeard = 0;
+}
+
+uint8_t Mle::GetFormationMessagesHeardSinceLastQuery(Mle::NetworkFormationMessages aMessageType)
+{
+    uint8_t retVal = 0;
+
+    switch(aMessageType)
+    {
+        case kFormationLinkRequest:
+            retVal = mFormationLinkRequestsHeardSinceLastQuery;
+            mFormationLinkRequestsHeardSinceLastQuery = 0;
+        break;
+
+        case kFormationParentRequestRouters:
+            retVal = mFormationParentRequestsRoutersHeardSinceLastQuery;
+            mFormationParentRequestsRoutersHeardSinceLastQuery = 0;
+        break;
+
+        case kFormationParentRequestREEDs:
+            retVal = mFormationParentRequestsREEDsHeardSinceLastQuery;
+            mFormationParentRequestsREEDsHeardSinceLastQuery = 0;
+        break;
+
+        default:
+        break;
+    }
+
+    return retVal;
+}
+
+uint32_t Mle::GetAttachTimerTimeLeft(void) const
+{
+    if (mAttachTimer.IsRunning())
+    {
+        return static_cast<uint32_t>(mAttachTimer.GetFireTime() - mAttachTimer.GetNow());
+    }
+    return static_cast<uint32_t>(0);
+}
+
+Error Mle::BecomeDetachedFromParent(void)
+{
+    mParentRecentlyAbandonedNode = true;
+    return BecomeDetached();
+}
 
 #if OPENTHREAD_CONFIG_MLE_INFORM_PREVIOUS_PARENT_ON_REATTACH
 void Mle::InformPreviousParent(void)
